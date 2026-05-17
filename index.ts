@@ -20,7 +20,7 @@ import { spawn } from "node:child_process";
 const isCliMode = () => process.env.OPENCLAW_CLI === "1";
 
 // Import core components
-import { MemoryStore, normalizeStoragePath, validateStoragePath } from "./src/store.js";
+import { MemoryStore, normalizeStoragePath, validateStoragePath, type MemoryEntry } from "./src/store.js";
 import {
   createEmbedder,
   getEffectiveVectorDimensions,
@@ -45,7 +45,10 @@ import {
   storeReflectionToLanceDB,
   loadAgentReflectionSlicesFromEntries,
   DEFAULT_REFLECTION_DERIVED_MAX_AGE_MS,
+  isOwnedByAgent,
+  isReflectionMetadataType,
 } from "./src/reflection-store.js";
+import { parseReflectionMetadata } from "./src/reflection-metadata.js";
 import {
   extractReflectionLearningGovernanceCandidates,
   extractInjectableReflectionMappedMemoryItems,
@@ -268,6 +271,7 @@ interface PluginConfig {
      */
     categoryField?: string;
   };
+  declaredAgents?: Set<string>;
 }
 
 type ReflectionThinkLevel = "off" | "minimal" | "low" | "medium" | "high";
@@ -452,22 +456,24 @@ function summarizeAgentEndMessages(messages: unknown[]): string {
   return `messages=${messages.length}, roles=[${roles}], stringContents=${stringContents}, arrayContents=${arrayContents}, textBlocks=${textBlocks}`;
 }
 
-const DEFAULT_SELF_IMPROVEMENT_REMINDER = `## Self-Improvement Reminder
-
-After completing tasks, evaluate if any learnings should be captured:
-
-**Log when:**
-- User corrects you -> .learnings/LEARNINGS.md
-- Command/operation fails -> .learnings/ERRORS.md
-- You discover your knowledge was wrong -> .learnings/LEARNINGS.md
-- You find a better approach -> .learnings/LEARNINGS.md
-
-**Promote when pattern is proven:**
-- Behavioral patterns -> SOUL.md
-- Workflow improvements -> AGENTS.md
-- Tool gotchas -> TOOLS.md
-
-Keep entries simple: date, title, what happened, what to do differently.`;
+const DEFAULT_SELF_IMPROVEMENT_REMINDER = [
+  "## Self-Improvement Reminder",
+  "",
+  "After completing tasks, evaluate if any learnings should be captured:",
+  "",
+  "**Log when:**",
+  "- User corrects you -> .learnings/LEARNINGS.md",
+  "- Command/operation fails -> .learnings/ERRORS.md",
+  "- You discover your knowledge was wrong -> .learnings/LEARNINGS.md",
+  "- You find a better approach -> .learnings/LEARNINGS.md",
+  "",
+  "**Promote when pattern is proven:**",
+  "- Behavioral patterns -> SOUL.md",
+  "- Workflow improvements -> AGENTS.md",
+  "- Tool gotchas -> TOOLS.md",
+  "",
+  "Keep entries simple: date, title, what happened, what to do differently.",
+].join("\n");
 
 const SELF_IMPROVEMENT_NOTE_PREFIX = "/note self-improvement (before reset):";
 const DEFAULT_REFLECTION_MESSAGE_COUNT = 120;
@@ -624,7 +630,7 @@ export function getExtensionApiImportSpecifiers(
 export async function loadEmbeddedPiRunner(api: OpenClawPluginApi): Promise<EmbeddedPiRunner> {
   // Layer 1: 嘗試新 SDK API (with circuit breaker)
   if (!isLayer1CircuitOpen()) {
-    const newApi = (api as unknown as Record<string, unknown>).runtime?.agent;
+    const newApi = ((api as unknown as { runtime?: { agent?: Record<string, unknown> } }).runtime?.agent);
     if (typeof newApi?.runEmbeddedPiAgent === "function") {
       const runner = newApi.runEmbeddedPiAgent.bind(newApi);
       // Bug 2 fix: 將 Layer 1 結果寫入 cache，避免後續並發呼叫時 Layer 2 覆蓋掉 Layer 1
@@ -2250,6 +2256,7 @@ const memoryLanceDBProPlugin = {
       limit: number;
       scopeFilter?: string[];
       category?: string;
+      source?: "manual" | "auto-recall" | "cli";
     }) {
       let results = await retriever.retrieve(params);
       if (results.length === 0) {
@@ -2267,7 +2274,7 @@ const memoryLanceDBProPlugin = {
       type LifecycleEntry = {
         id: string;
         text: string;
-        category: "preference" | "fact" | "decision" | "entity" | "other";
+        category: MemoryEntry["category"];
         scope: string;
         importance: number;
         timestamp: number;
@@ -2605,7 +2612,7 @@ const memoryLanceDBProPlugin = {
           .then(async (should) => {
             if (!should) return;
             await recordCompactionRun(compactionStateFile);
-            const result = await runCompaction(store, embedder, compactionCfg, undefined, api.logger);
+            const result = await runCompaction(store as any, embedder, compactionCfg, undefined, api.logger);
             if (result.clustersFound > 0) {
               api.logger.info(
                 `memory-compactor [auto]: compacted ${result.memoriesDeleted} → ${result.memoriesCreated} entries`,
@@ -2750,7 +2757,7 @@ const memoryLanceDBProPlugin = {
         // See: https://github.com/CortexReach/memory-lancedb-pro/issues/253
         let autoRecallTimedOut = false;
         let lateAutoRecallLogged = false;
-        const recallWork = async (): Promise<{ prependContext: string } | undefined> => {
+        const recallWork = async (): Promise<{ prependContext: string; ephemeral?: boolean } | undefined> => {
           // Determine agent ID and accessible scopes
           const agentId = resolveHookAgentId(ctx?.agentId, (event as any).sessionKey);
           if (isInvalidAgentIdFormat(agentId, config.declaredAgents)) {
@@ -2914,7 +2921,7 @@ const memoryLanceDBProPlugin = {
                 // Reading from raw JSON (not metaObj) avoids relying on parseSmartMetadata
                 // passing through unknown fields.
                 const categoryFieldName = config.recallPrefix?.categoryField;
-                let effectiveCategory = displayCategory;
+                let effectiveCategory: string = displayCategory;
                 if (categoryFieldName) {
                   try {
                     const rawMeta: Record<string, unknown> = r.entry.metadata
@@ -3604,7 +3611,7 @@ const memoryLanceDBProPlugin = {
           // placeholder metadata.
           const entry = await store.getById(recallId, undefined);
           if (!entry) continue;
-          const meta = parseSmartMetadata(entry.metadata, entry);
+          const meta = parseSmartMetadata(entry.metadata, entry) as Record<string, any>;
 
           if (usedRecall) {
             // Recall was used - increase importance (cap at 1.0).
@@ -3736,8 +3743,9 @@ const memoryLanceDBProPlugin = {
             // postRotationStartupUntilMs mechanism (PR #49001).
             // Note: Provider lives in sessionEntry.Provider; MessageThreadId lives in
             // sessionEntry.threadId (populated from ctx.MessageThreadId at session creation).
-            const provider = contextForLog.sessionEntry?.Provider ?? "";
-            const threadId = contextForLog.sessionEntry?.threadId;
+            const sessionEntryForLog = (contextForLog as { sessionEntry?: Record<string, any> }).sessionEntry;
+            const provider = sessionEntryForLog?.Provider ?? "";
+            const threadId = sessionEntryForLog?.threadId;
             if (provider === "discord" && (threadId == null || threadId === "")) {
               api.logger.info(
                 `self-improvement: command:${action} skipped on Discord channel (non-thread) reset to avoid startup race; use /new in thread or restart gateway if startup is incomplete`
@@ -4272,7 +4280,7 @@ const memoryLanceDBProPlugin = {
               text: mapped.text,
               vector,
               importance,
-              category: mapped.category,
+              category: mapped.category as MemoryEntry["category"],
               scope: targetScope,
               metadata,
             });
