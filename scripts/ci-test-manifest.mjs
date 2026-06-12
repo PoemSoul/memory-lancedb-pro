@@ -35,6 +35,7 @@ export const CI_TEST_MANIFEST = [
   { group: "core-regression", runner: "node", file: "test/memory-governance-tools.test.mjs", args: ["--test"] },
   { group: "core-regression", runner: "node", file: "test/corpus-indexer.test.mjs" },
   { group: "packaging-and-workflow", runner: "node", file: "test/plugin-manifest-regression.mjs" },
+  { group: "packaging-and-workflow", runner: "node", file: "test/openclaw-twitter-source-recipe.test.mjs", args: ["--test"] },
   { group: "packaging-and-workflow", runner: "node", file: "test/package-runtime.test.mjs" },
   { group: "packaging-and-workflow", runner: "node", file: "test/release-readiness.test.mjs" },
   { group: "core-regression", runner: "node", file: "test/session-summary-before-reset.test.mjs", args: ["--test"] },
