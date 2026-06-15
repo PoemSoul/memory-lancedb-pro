@@ -341,6 +341,8 @@ export class MemoryRetriever {
         const { query, limit, scopeFilter, category, source, signal, rerankTimeoutMs, rerankDeadlineMs } = context;
         const safeLimit = clampInt(limit, 1, 20);
         this.lastDiagnostics = null;
+        // FLEET-PATCH(#884): resolve lazy store init BEFORE routing reads hasFtsSupport.
+        await this.store.ensureInitialized?.();
         const diagnostics = {
             source,
             mode: this.config.mode,
