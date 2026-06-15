@@ -2212,6 +2212,7 @@
       "memory_recall",
       "memory_search",
       "memory_get",
+      "memory_fact_query",
       "memory_store",
       "memory_update",
       "memory_forget",
